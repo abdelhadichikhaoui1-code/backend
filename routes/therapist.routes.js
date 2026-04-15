@@ -1,3 +1,4 @@
+// ...existing code...
 // Route pour servir une vidéo depuis GridFS
 router.get('/video/:id', async (req, res) => {
   try {
