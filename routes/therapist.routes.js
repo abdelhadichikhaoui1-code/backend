@@ -1,9 +1,18 @@
 // ...existing code...
+
+const express = require('express');
+const router = express.Router();
+const auth = require('../middleware/auth.middleware');
+const Patient = require('../models/Patient');
+const Session = require('../models/Session');
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
+const { initGridFS } = require('../models/gridfs');
+const mongoose = require('mongoose');
+
 // Route pour servir une vidéo depuis GridFS
 router.get('/video/:id', async (req, res) => {
   try {
-    const { initGridFS } = require('../models/gridfs');
-    const mongoose = require('mongoose');
     const gfs = initGridFS(mongoose.connection);
     const { ObjectId } = require('mongodb');
     const fileId = new ObjectId(req.params.id);
@@ -18,16 +27,6 @@ router.get('/video/:id', async (req, res) => {
     res.status(500).json({ message: 'Erreur serveur', error: err.message });
   }
 });
-const express = require('express');
-const router = express.Router();
-const auth = require('../middleware/auth.middleware');
-const Patient = require('../models/Patient');
-const Session = require('../models/Session');
-
-const multer = require('multer');
-const upload = multer({ storage: multer.memoryStorage() });
-const { initGridFS } = require('../models/gridfs');
-const mongoose = require('mongoose');
 
 router.use(auth(['therapist']));
 
