@@ -12,6 +12,7 @@ const { initGridFS } = require('../models/gridfs');
 const mongoose = require('mongoose');
 const { isValidObjectId } = mongoose;
 const { ObjectId } = require('mongodb');
+const { uploadVideoToDrive, deleteVideoFromDrive } = require('../services/googleDriveService');
 
 function extractVideoId(videoPath = '') {
   const match = String(videoPath).match(/\/api\/therapist\/video\/([a-fA-F0-9]{24})$/);
@@ -24,12 +25,22 @@ function collectVideoIds(exercises = []) {
     .filter(Boolean);
 }
 
-async function deleteGridFsFileById(fileId) {
-  try {
-    const gfs = initGridFS(mongoose.connection);
-    await gfs.delete(new ObjectId(fileId));
-  } catch (e) {
-    // Ignore missing/corrupt file ids to avoid blocking delete flow.
+async function deleteVideo(videoPath) {
+  if (!videoPath) return;
+  
+  // If it's a GridFS path
+  const gridFsId = extractVideoId(videoPath);
+  if (gridFsId) {
+    try {
+      const gfs = initGridFS(mongoose.connection);
+      await gfs.delete(new ObjectId(gridFsId));
+    } catch (e) {}
+    return;
+  }
+
+  // If it's a Google Drive link
+  if (videoPath.includes('drive.google.com')) {
+    await deleteVideoFromDrive(videoPath);
   }
 }
 
@@ -91,10 +102,7 @@ router.post('/sessions', upload.any(), async (req, res) => {
       return res.status(400).json({ message: 'Ajoutez au moins un exercice.' });
     }
 
-    // Init GridFS bucket
-    const gfs = initGridFS(mongoose.connection);
-
-    // Upload videos to GridFS and get their ids
+    // Upload videos to Google Drive
     const exercisePromises = exercises.map(async (ex, i) => {
       const cleanExerciseTitle = String(ex.title ?? '').trim();
       const duration = Number(ex.duration);
@@ -104,25 +112,18 @@ router.post('/sessions', upload.any(), async (req, res) => {
       }
 
       const file = req.files.find(f => f.fieldname === `video_${i}`);
-      let videoId = null;
+      let videoPath = ex.videoPath || ex.videoUrl || '';
+
       if (file) {
-        // Store in GridFS
-        const uploadStream = gfs.openUploadStream(file.originalname, {
-          contentType: file.mimetype
-        });
-        uploadStream.end(file.buffer);
-        await new Promise((resolve, reject) => {
-          uploadStream.on('finish', resolve);
-          uploadStream.on('error', reject);
-        });
-        videoId = uploadStream.id;
+        // Upload to Google Drive
+        videoPath = await uploadVideoToDrive(file);
       }
       return {
         title: cleanExerciseTitle,
         description: ex.description,
         duration,
         repetitions: Number.isFinite(repetitions) && repetitions > 0 ? repetitions : 1,
-        videoPath: videoId ? `/api/therapist/video/${videoId}` : (ex.videoPath || ex.videoUrl || '')
+        videoPath: videoPath
       };
     });
 
@@ -166,8 +167,8 @@ router.delete('/sessions/:id', async (req, res) => {
     const session = await Session.findOneAndDelete({ _id: req.params.id, therapistId: req.user.userId });
     if (!session) return res.status(404).json({ message: 'Séance non trouvée' });
 
-    const videoIds = collectVideoIds(session.exercises);
-    await Promise.all(videoIds.map(deleteGridFsFileById));
+    const videoPaths = session.exercises.map(ex => ex.videoPath).filter(Boolean);
+    await Promise.all(videoPaths.map(deleteVideo));
     await PatientSession.deleteMany({ sessionId: session._id });
 
     res.json({ message: 'Séance supprimée' });
@@ -208,7 +209,7 @@ router.put('/sessions/:id', upload.any(), async (req, res) => {
     const currentSession = await Session.findOne({ _id: req.params.id, therapistId: req.user.userId });
     if (!currentSession) return res.status(404).json({ message: 'Séance non trouvée' });
 
-    const gfs = initGridFS(mongoose.connection);
+    // Process exercises and uploads
 
     const exercisePromises = exercises.map(async (ex, i) => {
       const cleanExerciseTitle = String(ex.title ?? '').trim();
@@ -219,24 +220,17 @@ router.put('/sessions/:id', upload.any(), async (req, res) => {
       }
 
       const file = req.files.find(f => f.fieldname === `video_${i}`);
-      let videoId = null;
+      let videoPath = ex.videoPath || ex.videoUrl || '';
+
       if (file) {
-        const uploadStream = gfs.openUploadStream(file.originalname, {
-          contentType: file.mimetype
-        });
-        uploadStream.end(file.buffer);
-        await new Promise((resolve, reject) => {
-          uploadStream.on('finish', resolve);
-          uploadStream.on('error', reject);
-        });
-        videoId = uploadStream.id;
+        videoPath = await uploadVideoToDrive(file);
       }
       return {
         title: cleanExerciseTitle,
         description: ex.description,
         duration,
         repetitions: Number.isFinite(repetitions) && repetitions > 0 ? repetitions : 1,
-        videoPath: videoId ? `/api/therapist/video/${videoId}` : (ex.videoPath || ex.videoUrl || '')
+        videoPath: videoPath
       };
     });
 
@@ -251,10 +245,10 @@ router.put('/sessions/:id', upload.any(), async (req, res) => {
       { new: true }
     );
 
-    const oldIds = collectVideoIds(currentSession.exercises);
-    const keptOrNewIds = new Set(collectVideoIds(exercisesWithVideos));
-    const removedIds = oldIds.filter(id => !keptOrNewIds.has(id));
-    await Promise.all(removedIds.map(deleteGridFsFileById));
+    const oldPaths = currentSession.exercises.map(ex => ex.videoPath).filter(Boolean);
+    const keptOrNewPaths = new Set(exercisesWithVideos.map(ex => ex.videoPath).filter(Boolean));
+    const removedPaths = oldPaths.filter(p => !keptOrNewPaths.has(p));
+    await Promise.all(removedPaths.map(deleteVideo));
 
     res.json(updatedSession);
   } catch (err) {
