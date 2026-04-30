@@ -5,10 +5,33 @@ const router = express.Router();
 const auth = require('../middleware/auth.middleware');
 const Patient = require('../models/Patient');
 const Session = require('../models/Session');
+const PatientSession = require('../models/PatientSession');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage() });
 const { initGridFS } = require('../models/gridfs');
 const mongoose = require('mongoose');
+const { isValidObjectId } = mongoose;
+const { ObjectId } = require('mongodb');
+
+function extractVideoId(videoPath = '') {
+  const match = String(videoPath).match(/\/api\/therapist\/video\/([a-fA-F0-9]{24})$/);
+  return match ? match[1] : null;
+}
+
+function collectVideoIds(exercises = []) {
+  return exercises
+    .map(ex => extractVideoId(ex.videoPath))
+    .filter(Boolean);
+}
+
+async function deleteGridFsFileById(fileId) {
+  try {
+    const gfs = initGridFS(mongoose.connection);
+    await gfs.delete(new ObjectId(fileId));
+  } catch (e) {
+    // Ignore missing/corrupt file ids to avoid blocking delete flow.
+  }
+}
 
 // Route pour servir une vidéo depuis GridFS
 router.get('/video/:id', async (req, res) => {
@@ -51,9 +74,21 @@ router.get('/patients', async (req, res) => {
 router.post('/sessions', upload.any(), async (req, res) => {
   try {
     const { title, exercisesData } = req.body;
+    const cleanTitle = String(title ?? '').trim();
+    if (!cleanTitle) {
+      return res.status(400).json({ message: 'Le titre de la séance est obligatoire.' });
+    }
+
     let exercises = [];
     if (exercisesData) {
-      exercises = JSON.parse(exercisesData);
+      try {
+        exercises = JSON.parse(exercisesData);
+      } catch (e) {
+        return res.status(400).json({ message: 'Format des exercices invalide.' });
+      }
+    }
+    if (!Array.isArray(exercises) || exercises.length === 0) {
+      return res.status(400).json({ message: 'Ajoutez au moins un exercice.' });
     }
 
     // Init GridFS bucket
@@ -61,6 +96,13 @@ router.post('/sessions', upload.any(), async (req, res) => {
 
     // Upload videos to GridFS and get their ids
     const exercisePromises = exercises.map(async (ex, i) => {
+      const cleanExerciseTitle = String(ex.title ?? '').trim();
+      const duration = Number(ex.duration);
+      const repetitions = Number(ex.repetitions || 1);
+      if (!cleanExerciseTitle || !Number.isFinite(duration) || duration <= 0) {
+        throw new Error('INVALID_EXERCISE_PAYLOAD');
+      }
+
       const file = req.files.find(f => f.fieldname === `video_${i}`);
       let videoId = null;
       if (file) {
@@ -76,11 +118,11 @@ router.post('/sessions', upload.any(), async (req, res) => {
         videoId = uploadStream.id;
       }
       return {
-        title: ex.title,
+        title: cleanExerciseTitle,
         description: ex.description,
-        duration: ex.duration,
-        repetitions: ex.repetitions,
-        videoPath: videoId ? `/api/therapist/video/${videoId}` : (ex.videoUrl || '')
+        duration,
+        repetitions: Number.isFinite(repetitions) && repetitions > 0 ? repetitions : 1,
+        videoPath: videoId ? `/api/therapist/video/${videoId}` : (ex.videoPath || ex.videoUrl || '')
       };
     });
 
@@ -88,13 +130,19 @@ router.post('/sessions', upload.any(), async (req, res) => {
 
     const newSession = new Session({
       therapistId: req.user.userId,
-      title,
+      title: cleanTitle,
       exercises: exercisesWithVideos
     });
 
     await newSession.save();
     res.status(201).json(newSession);
   } catch (err) {
+    if (err.message === 'INVALID_EXERCISE_PAYLOAD') {
+      return res.status(400).json({ message: "Chaque exercice doit avoir un titre et une durée valide." });
+    }
+    if (`${err?.message || ''}`.toLowerCase().includes('space quota')) {
+      return res.status(507).json({ message: 'Stockage sature. Supprimez des programmes/videos puis reessayez.' });
+    }
     res.status(500).json({ message: 'Erreur serveur', error: err.message });
   }
 });
@@ -112,10 +160,22 @@ router.get('/sessions', async (req, res) => {
 // Supprimer une séance
 router.delete('/sessions/:id', async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: 'Identifiant de séance invalide.' });
+    }
     const session = await Session.findOneAndDelete({ _id: req.params.id, therapistId: req.user.userId });
     if (!session) return res.status(404).json({ message: 'Séance non trouvée' });
+
+    const videoIds = collectVideoIds(session.exercises);
+    await Promise.all(videoIds.map(deleteGridFsFileById));
+    await PatientSession.deleteMany({ sessionId: session._id });
+
     res.json({ message: 'Séance supprimée' });
   } catch (err) {
+    console.error('DELETE /therapist/sessions/:id failed:', err);
+    if (`${err?.message || ''}`.toLowerCase().includes('space quota')) {
+      return res.status(507).json({ message: 'Stockage sature. La suppression est bloquee par Mongo Atlas tant que le quota est depasse.' });
+    }
     res.status(500).json({ message: 'Erreur serveur', error: err.message });
   }
 });
@@ -123,15 +183,41 @@ router.delete('/sessions/:id', async (req, res) => {
 // Modifier une séance (Metadata + Exercices)
 router.put('/sessions/:id', upload.any(), async (req, res) => {
   try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: 'Identifiant de séance invalide.' });
+    }
+
     const { title, exercisesData } = req.body;
+    const cleanTitle = String(title ?? '').trim();
+    if (!cleanTitle) {
+      return res.status(400).json({ message: 'Le titre de la séance est obligatoire.' });
+    }
+
     let exercises = [];
     if (exercisesData) {
-      exercises = JSON.parse(exercisesData);
+      try {
+        exercises = JSON.parse(exercisesData);
+      } catch (e) {
+        return res.status(400).json({ message: 'Format des exercices invalide.' });
+      }
     }
+    if (!Array.isArray(exercises) || exercises.length === 0) {
+      return res.status(400).json({ message: 'Ajoutez au moins un exercice.' });
+    }
+
+    const currentSession = await Session.findOne({ _id: req.params.id, therapistId: req.user.userId });
+    if (!currentSession) return res.status(404).json({ message: 'Séance non trouvée' });
 
     const gfs = initGridFS(mongoose.connection);
 
     const exercisePromises = exercises.map(async (ex, i) => {
+      const cleanExerciseTitle = String(ex.title ?? '').trim();
+      const duration = Number(ex.duration);
+      const repetitions = Number(ex.repetitions || 1);
+      if (!cleanExerciseTitle || !Number.isFinite(duration) || duration <= 0) {
+        throw new Error('INVALID_EXERCISE_PAYLOAD');
+      }
+
       const file = req.files.find(f => f.fieldname === `video_${i}`);
       let videoId = null;
       if (file) {
@@ -146,10 +232,10 @@ router.put('/sessions/:id', upload.any(), async (req, res) => {
         videoId = uploadStream.id;
       }
       return {
-        title: ex.title,
+        title: cleanExerciseTitle,
         description: ex.description,
-        duration: ex.duration,
-        repetitions: ex.repetitions,
+        duration,
+        repetitions: Number.isFinite(repetitions) && repetitions > 0 ? repetitions : 1,
         videoPath: videoId ? `/api/therapist/video/${videoId}` : (ex.videoPath || ex.videoUrl || '')
       };
     });
@@ -159,15 +245,25 @@ router.put('/sessions/:id', upload.any(), async (req, res) => {
     const updatedSession = await Session.findOneAndUpdate(
       { _id: req.params.id, therapistId: req.user.userId },
       {
-        title,
+        title: cleanTitle,
         exercises: exercisesWithVideos
       },
       { new: true }
     );
 
-    if (!updatedSession) return res.status(404).json({ message: 'Séance non trouvée' });
+    const oldIds = collectVideoIds(currentSession.exercises);
+    const keptOrNewIds = new Set(collectVideoIds(exercisesWithVideos));
+    const removedIds = oldIds.filter(id => !keptOrNewIds.has(id));
+    await Promise.all(removedIds.map(deleteGridFsFileById));
+
     res.json(updatedSession);
   } catch (err) {
+    if (err.message === 'INVALID_EXERCISE_PAYLOAD') {
+      return res.status(400).json({ message: "Chaque exercice doit avoir un titre et une durée valide." });
+    }
+    if (`${err?.message || ''}`.toLowerCase().includes('space quota')) {
+      return res.status(507).json({ message: 'Stockage sature. Supprimez des programmes/videos puis reessayez.' });
+    }
     res.status(500).json({ message: 'Erreur serveur', error: err.message });
   }
 });

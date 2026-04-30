@@ -3,7 +3,7 @@ const bcrypt = require('bcryptjs');
 const Therapist = require('./models/Therapist');
 require('dotenv').config();
 
-mongoose.connect(process.env.MONGO_URI).then(async () => {
+mongoose.connect(process.env.MONGODB_URI).then(async () => {
   const exists = await Therapist.findOne({ nom: 'Dr. Dupont' });
   if (exists) {
     console.log('Therapist already exists');

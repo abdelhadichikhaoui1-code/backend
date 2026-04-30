@@ -9,20 +9,37 @@ const Therapist = require('../models/Therapist');
 router.post('/register', async (req, res) => {
   try {
     const { nom, age, password, confirmPassword } = req.body;
+    const cleanNom = String(nom ?? '').trim();
+    const numericAge = Number(age);
+
+    if (!cleanNom) {
+      return res.status(400).json({ message: 'Le nom est obligatoire.' });
+    }
+    if (!Number.isFinite(numericAge) || numericAge < 1 || numericAge > 120) {
+      return res.status(400).json({ message: "L'âge doit être un nombre entre 1 et 120." });
+    }
+    if (!password || password.length < 4) {
+      return res.status(400).json({ message: 'Le mot de passe doit contenir au moins 4 caractères.' });
+    }
     
     if (password !== confirmPassword) {
       return res.status(400).json({ message: 'Les mots de passe ne correspondent pas' });
     }
 
-    let patient = await Patient.findOne({ nom });
+    let patient = await Patient.findOne({ nom: cleanNom });
     if (patient) return res.status(400).json({ message: 'Ce nom ou identifiant est déjà pris' });
+
+    const therapistWithSameName = await Therapist.findOne({ nom: cleanNom });
+    if (therapistWithSameName) {
+      return res.status(400).json({ message: 'Ce nom est déjà utilisé par un thérapeute. Choisissez un autre identifiant.' });
+    }
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
     patient = new Patient({
-      nom,
-      age,
+      nom: cleanNom,
+      age: numericAge,
       password: hashedPassword
     });
 
@@ -33,6 +50,15 @@ router.post('/register', async (req, res) => {
 
     res.status(201).json({ user: { id: patient._id, nom: patient.nom, role: 'patient' }, token });
   } catch (err) {
+    const errorText = `${err?.message || ''}`.toLowerCase();
+    if (errorText.includes('space quota')) {
+      return res.status(507).json({
+        message: 'Base de donnees saturee. Supprimez des videos/sessions puis reessayez.'
+      });
+    }
+    if (err && err.code === 11000) {
+      return res.status(400).json({ message: 'Ce nom ou identifiant est déjà pris' });
+    }
     if (err.name === 'ValidationError') {
        return res.status(400).json({ message: 'Veuillez remplir correctement tous les champs requis (nom, âge, password).' });
     }
@@ -45,14 +71,19 @@ router.post('/login', async (req, res) => {
   try {
     // Dans le UI on demandera Nom et Password.
     const { nom, password } = req.body;
+    const cleanNom = String(nom ?? '').trim();
+
+    if (!cleanNom || !password) {
+      return res.status(400).json({ message: 'Veuillez renseigner le nom et le mot de passe.' });
+    }
 
     // Check Thérapeutes en priorité
-    let user = await Therapist.findOne({ nom });
+    let user = await Therapist.findOne({ nom: cleanNom });
     let role = 'therapist';
 
     // Sinon check Patients
     if (!user) {
-      user = await Patient.findOne({ nom });
+      user = await Patient.findOne({ nom: cleanNom });
       role = 'patient';
     }
 
